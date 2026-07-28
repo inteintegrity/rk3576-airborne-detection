@@ -1,0 +1,11 @@
+# Airborne Object Detection - RK3576 NPU Dependencies
+# Runtime: RK3576 (ARM Linux)
+
+# RKNN inference engine (Rockchip NPU)
+# Install from the whl package provided by Rockchip:
+#   pip install rknn_toolkit_lite2-2.3.2-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+# Import: from rknnlite.api import RKNNLite
+
+# Image processing
+opencv-python>=4.5.0
+numpy>=1.19.0
