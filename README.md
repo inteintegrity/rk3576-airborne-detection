@@ -17,7 +17,7 @@ Real-time drone-view object detection using YOLOv8s (VisDrone fine-tuned) with R
 ├── requirements.txt              # Web service dependencies
 ├── requirements_rknn.txt         # NPU detection dependencies
 ├── model/
-│   └── best.rknn                 # VisDrone YOLOv8s RKNN model
+│   └── Yolov8s_airborne.rknn                 # VisDrone YOLOv8s RKNN model
 ├── lib/
 │   └── librknnrt.so              # RKNN runtime library
 ├── py_utils/
