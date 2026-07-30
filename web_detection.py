@@ -153,6 +153,10 @@ class VideoAnalyzer:
                         if boxes is not None:
                             draw(frame, self.co_helper.get_real_box(boxes), scores, classes)
 
+                # Push to web for real-time display
+                _, buffer = cv2.imencode('.jpg', frame)
+                frame_buffer.set_frame(buffer.tobytes(), frame)
+
                 out.write(frame)
                 frame_idx += 1
                 self.progress = int((frame_idx / total_frames) * 100)
@@ -561,6 +565,12 @@ async def index():
             const data = await res.json();
 
             if (data.status === 'started') {
+                // Switch to real-time tab to show live detection
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.getElementById('realtime').classList.add('active');
+                document.querySelector('.tab').classList.add('active');
+                document.getElementById('streamImg').src = '/api/video_feed';
                 startStatusPolling();
             } else {
                 alert(data.message || 'Error starting analysis');
@@ -610,221 +620,110 @@ def run_fastapi(host, port):
 
     uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
 
-# ============== NEW: Single-head post-processing for YOLOv8 exported with merge ==============
-def post_process_single(output, obj_thresh, nms_thresh):
-    """
-    Process single-head output (shape: (1, C, N)) where C = 4 + num_classes.
-    This handles YOLOv8 default export (merged three detection heads).
-    """
-    if output is None:
-        return None, None, None
+# --- Inference logic (YOLOv8 DFL + NMS post-processing) ---
 
-    # Assume output shape (1, C, N)
-    C = output.shape[1]
-    num_classes = len(CLASSES)
-    # Verify channel count, but try to adapt if not exact
-    if C != 4 + num_classes:
-        print(f"Info: C={C}, expected {4+num_classes} for {num_classes} classes. Adjusting...")
-        # If C is larger, take first 4 as bbox, rest as classes
-        # But we assume the model was exported with the correct class count.
-        # However, we can derive num_classes = C - 4
-        num_classes = C - 4
-        if num_classes <= 0:
-            print("Error: Invalid output channel count")
-            return None, None, None
-
-    # Split bbox (cx, cy, w, h) and class scores
-    bbox = output[:, :4, :]          # (1, 4, N)
-    cls_scores = output[:, 4:, :]    # (1, num_classes, N)
-
-    # Decode bounding boxes with grid and stride
-    N = output.shape[2]
-    # Define three scales (80x80, 40x40, 20x20) and their strides
-    grid_sizes = [80, 40, 20]
-    strides = [8, 16, 32]
-    anchor_cumsum = np.cumsum([0] + [g*g for g in grid_sizes])
-    # Prepare grid coordinates and stride for each anchor
-    grid_xs = np.zeros(N, dtype=np.float32)
-    grid_ys = np.zeros(N, dtype=np.float32)
-    stride_arr = np.zeros(N, dtype=np.float32)
-    for i, (g, s) in enumerate(zip(grid_sizes, strides)):
-        start = anchor_cumsum[i]
-        end = anchor_cumsum[i+1]
-        xs = np.tile(np.arange(g), g)
-        ys = np.repeat(np.arange(g), g)
-        grid_xs[start:end] = xs.astype(np.float32)
-        grid_ys[start:end] = ys.astype(np.float32)
-        stride_arr[start:end] = s
-
-    # Convert to xyxy in original image coordinates (640x640)
-    bbox_np = bbox.squeeze(0).T  # (N, 4)
-    cx = bbox_np[:, 0]
-    cy = bbox_np[:, 1]
-    w = bbox_np[:, 2]
-    h = bbox_np[:, 3]
-
-    cx_real = (grid_xs + cx) * stride_arr
-    cy_real = (grid_ys + cy) * stride_arr
-    w_real = w * stride_arr
-    h_real = h * stride_arr
-
-    x1 = cx_real - w_real / 2
-    y1 = cy_real - h_real / 2
-    x2 = cx_real + w_real / 2
-    y2 = cy_real + h_real / 2
-    boxes = np.stack([x1, y1, x2, y2], axis=1)  # (N, 4)
-
-    # Scores and classes
-    cls_scores_np = cls_scores.squeeze(0).T  # (N, num_classes)
-    class_max_score = np.max(cls_scores_np, axis=1)
-    classes = np.argmax(cls_scores_np, axis=1)
-    scores = class_max_score
-
-    # Thresholding
-    keep = scores >= obj_thresh
-    if not np.any(keep):
-        return None, None, None
-    boxes = boxes[keep]
-    scores = scores[keep]
-    classes = classes[keep]
-
-    # NMS per class
-    final_boxes, final_scores, final_classes = [], [], []
-    for c in set(classes):
-        mask = classes == c
-        b = boxes[mask]
-        s = scores[mask]
-        if len(b) == 0:
-            continue
-
-        # NMS calculation
-        x = b[:, 0]
-        y = b[:, 1]
-        w_nms = b[:, 2] - b[:, 0]
-        h_nms = b[:, 3] - b[:, 1]
-        areas = w_nms * h_nms
-        order = s.argsort()[::-1]
-        keep_nms = []
-        while order.size > 0:
-            i = order[0]
-            keep_nms.append(i)
-            xx1 = np.maximum(x[i], x[order[1:]])
-            yy1 = np.maximum(y[i], y[order[1:]])
-            xx2 = np.minimum(x[i] + w_nms[i], x[order[1:]] + w_nms[order[1:]])
-            yy2 = np.minimum(y[i] + h_nms[i], y[order[1:]] + h_nms[order[1:]])
-            inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
-            ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            inds = np.where(ovr <= nms_thresh)[0]
-            order = order[inds + 1]
-
-        if len(keep_nms) > 0:
-            final_boxes.append(b[keep_nms])
-            final_scores.append(s[keep_nms])
-            final_classes.append(np.full(len(keep_nms), c))
-
-    if not final_boxes:
-        return None, None, None
-    return np.concatenate(final_boxes), np.concatenate(final_classes), np.concatenate(final_scores)
-
-# ============== Modified post_process_with_thresh to support both multi-head and single-head ==============
 def post_process_with_thresh(outputs, obj_thresh, nms_thresh):
-    """
-    YOLOv8 post-processing with auto-detection of output format.
-    Supports both multi-head (6 tensors, with DFL) and single-head (1 tensor, merged).
-    """
+    """YOLOv8 post-processing. Handles both single-output and 3-branch DFL formats."""
     if outputs is None:
         return None, None, None
 
-    # If outputs is a list
-    if isinstance(outputs, list):
-        # Check if single-head: only one output and shape is (1, C, N) with C>4
-        if len(outputs) == 1:
-            single_output = outputs[0]
-            if single_output.ndim == 3 and single_output.shape[1] > 4:
-                return post_process_single(single_output, obj_thresh, nms_thresh)
-        # If not single-head, try multi-head (expected 6 outputs)
-        if len(outputs) != 6:
-            # Fallback: try to treat first output as single-head if it matches shape
-            if len(outputs) >= 1 and outputs[0].ndim == 3 and outputs[0].shape[1] > 4:
-                print("Info: Number of outputs != 6, treating as single-head.")
-                return post_process_single(outputs[0], obj_thresh, nms_thresh)
-            else:
-                print(f"Warning: Unexpected output format: {len(outputs)} outputs. Falling back to multi-head attempt.")
-                # Proceed with multi-head assumption (may fail)
-        # Multi-head processing (original logic for 6 outputs)
-        boxes, scores, classes_conf = [], [], []
-        default_branch = 3
-        pair_per_branch = len(outputs) // default_branch
-        for i in range(default_branch):
-            boxes.append(box_process(outputs[pair_per_branch * i]))
-            classes_conf.append(outputs[pair_per_branch * i + 1])
-            scores.append(np.ones_like(outputs[pair_per_branch * i + 1][:, :1, :, :], dtype=np.float32))
+    # Detect output format: single tensor (1, 15, 8400) vs 3-branch DFL
+    if len(outputs) == 1 and len(outputs[0].shape) == 3:
+        # Single output format: (1, 4+nc, num_anchors) - already DFL decoded
+        output = outputs[0]
+        if output.shape[0] == 1:
+            output = output[0]  # (15, 8400)
+        # Transpose to (8400, 15)
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+
+        boxes = output[:, :4]       # cx, cy, w, h
+        classes_conf = output[:, 4:]  # class scores
+
+        # cx,cy,w,h -> x1,y1,x2,y2
+        boxes_xyxy = np.zeros_like(boxes)
+        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+
+        boxes = boxes_xyxy
+        scores_flat = np.ones(len(classes_conf), dtype=np.float32)
+        class_max_score = np.max(classes_conf, axis=-1)
+        classes = np.argmax(classes_conf, axis=-1)
+
+        _class_pos = np.where(class_max_score * scores_flat >= obj_thresh)
+        scores = (class_max_score * scores_flat)[_class_pos]
+        boxes = boxes[_class_pos]
+        classes = classes[_class_pos]
+
+    else:
+        # 3-branch DFL format (original reference project format)
+        all_boxes, all_scores, all_classes_conf = [], [], []
+        defualt_branch = 3
+        pair_per_branch = len(outputs) // defualt_branch
+        for i in range(defualt_branch):
+            all_boxes.append(box_process(outputs[pair_per_branch * i]))
+            all_classes_conf.append(outputs[pair_per_branch * i + 1])
+            all_scores.append(np.ones_like(outputs[pair_per_branch * i + 1][:, :1, :, :], dtype=np.float32))
 
         def sp_flatten(_in):
             ch = _in.shape[1]
             _in = _in.transpose(0, 2, 3, 1)
             return _in.reshape(-1, ch)
 
-        boxes = np.concatenate([sp_flatten(_v) for _v in boxes])
-        classes_conf = np.concatenate([sp_flatten(_v) for _v in classes_conf])
-        scores = np.concatenate([sp_flatten(_v) for _v in scores])
+        boxes = np.concatenate([sp_flatten(_v) for _v in all_boxes])
+        classes_conf = np.concatenate([sp_flatten(_v) for _v in all_classes_conf])
+        scores = np.concatenate([sp_flatten(_v) for _v in all_scores])
 
-        # Filter boxes
         scores_flat = scores.reshape(-1)
         class_max_score = np.max(classes_conf, axis=-1)
         classes = np.argmax(classes_conf, axis=-1)
         _class_pos = np.where(class_max_score * scores_flat >= obj_thresh)
-
         scores = (class_max_score * scores_flat)[_class_pos]
         boxes = boxes[_class_pos]
         classes = classes[_class_pos]
 
-        if len(classes) == 0:
-            return None, None, None
+    if len(classes) == 0:
+        return None, None, None
 
-        nboxes, nclasses, nscores = [], [], []
-        for c in set(classes):
-            inds = np.where(classes == c)[0]
-            b = boxes[inds]
-            s = scores[inds]
+    nboxes, nclasses, nscores = [], [], []
+    for c in set(classes):
+        inds = np.where(classes == c)[0]
+        b = boxes[inds]
+        s = scores[inds]
 
-            # NMS
-            x = b[:, 0]
-            y = b[:, 1]
-            w_nms = b[:, 2] - b[:, 0]
-            h_nms = b[:, 3] - b[:, 1]
-            areas = w_nms * h_nms
-            order = s.argsort()[::-1]
-            keep = []
-            while order.size > 0:
-                i = order[0]
-                keep.append(i)
-                xx1 = np.maximum(x[i], x[order[1:]])
-                yy1 = np.maximum(y[i], y[order[1:]])
-                xx2 = np.minimum(x[i] + w_nms[i], x[order[1:]] + w_nms[order[1:]])
-                yy2 = np.minimum(y[i] + h_nms[i], y[order[1:]] + h_nms[order[1:]])
-                w1 = np.maximum(0.0, xx2 - xx1 + 0.00001)
-                h1 = np.maximum(0.0, yy2 - yy1 + 0.00001)
-                inter = w1 * h1
-                ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-                inds_nms = np.where(ovr <= nms_thresh)[0]
-                order = order[inds_nms + 1]
+        # NMS
+        x = b[:, 0]
+        y = b[:, 1]
+        w = b[:, 2] - b[:, 0]
+        h = b[:, 3] - b[:, 1]
+        areas = w * h
+        order = s.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            xx1 = np.maximum(x[i], x[order[1:]])
+            yy1 = np.maximum(y[i], y[order[1:]])
+            xx2 = np.minimum(x[i] + w[i], x[order[1:]] + w[order[1:]])
+            yy2 = np.minimum(y[i] + h[i], y[order[1:]] + h[order[1:]])
+            w1 = np.maximum(0.0, xx2 - xx1 + 0.00001)
+            h1 = np.maximum(0.0, yy2 - yy1 + 0.00001)
+            inter = w1 * h1
+            ovr = inter / (areas[i] + areas[order[1:]] - inter)
+            inds_nms = np.where(ovr <= nms_thresh)[0]
+            order = order[inds_nms + 1]
 
-            if len(keep) > 0:
-                nboxes.append(b[keep])
-                nclasses.append(np.full(len(keep), c))
-                nscores.append(s[keep])
+        if len(keep) > 0:
+            nboxes.append(b[keep])
+            nclasses.append(np.full(len(keep), c))
+            nscores.append(s[keep])
 
-        if not nboxes:
-            return None, None, None
-        return np.concatenate(nboxes), np.concatenate(nclasses), np.concatenate(nscores)
-    else:
-        # Not a list, treat as single ndarray
-        if outputs.ndim == 3 and outputs.shape[1] > 4:
-            return post_process_single(outputs, obj_thresh, nms_thresh)
-        else:
-            print("Error: Unsupported output type/shape")
-            return None, None, None
+    if not nboxes:
+        return None, None, None
+
+    return np.concatenate(nboxes), np.concatenate(nclasses), np.concatenate(nscores)
 
 def dfl(position):
     """Distribution Focal Loss decoding."""
